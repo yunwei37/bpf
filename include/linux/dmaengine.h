@@ -325,7 +325,8 @@ struct dma_router {
  * @lock: protect between config and prepare transfer when driver have not
  *	  implemented callback device_prep_config_sg().
  * @chan_id: channel ID for sysfs
- * @dev: class device for sysfs
+ * @chan_dev: class channel device for sysfs, some device use it for per-channel
+ *            IOMMU mapping.
  * @name: backlink name for sysfs
  * @dbg_client_name: slave name for debugfs in format:
  *	dev_name(requester's dev):channel name, for example: "2b00000.mcasp:tx"
@@ -351,7 +352,14 @@ struct dma_chan {
 
 	/* sysfs */
 	int chan_id;
-	struct dma_chan_dev *dev;
+	union {
+		struct dma_chan_dev *chan_dev;
+		/*
+		 * Use chan_dev; dev will be removed once all users are
+		 * converted.
+		 */
+		struct dma_chan_dev *dev;
+	};
 	const char *name;
 #ifdef CONFIG_DEBUG_FS
 	char *dbg_client_name;
@@ -368,6 +376,26 @@ struct dma_chan {
 
 	void *private;
 };
+
+#define DMA_CHAN_ID_STATIC	BIT(30)
+
+/**
+ * dmaengine_set_static_chan_id - request an exact DMA engine channel ID
+ * @chan: DMA channel
+ * @id: channel ID, unique within the DMA device
+ *
+ * Drivers may call this after initializing @chan and before registering its
+ * DMA device. The dmaengine core reserves @id from the device IDA instead of
+ * assigning the next available ID.
+ */
+static inline void dmaengine_set_static_chan_id(struct dma_chan *chan,
+						unsigned int id)
+{
+	if (WARN_ON_ONCE(id >= DMA_CHAN_ID_STATIC))
+		return;
+
+	chan->chan_id = DMA_CHAN_ID_STATIC | id;
+}
 
 /**
  * struct dma_chan_dev - relate sysfs device node to backing channel device
@@ -532,7 +560,7 @@ struct dma_slave_caps {
 
 static inline const char *dma_chan_name(struct dma_chan *chan)
 {
-	return dev_name(&chan->dev->device);
+	return dev_name(&chan->chan_dev->device);
 }
 
 /**
@@ -1760,15 +1788,6 @@ void dma_run_dependencies(struct dma_async_tx_descriptor *tx);
 #define dma_request_channel(mask, x, y) \
 	__dma_request_channel(&(mask), x, y, NULL)
 
-/* Deprecated, please use dma_request_chan() directly */
-static inline struct dma_chan * __deprecated
-dma_request_slave_channel(struct device *dev, const char *name)
-{
-	struct dma_chan *ch = dma_request_chan(dev, name);
-
-	return IS_ERR(ch) ? NULL : ch;
-}
-
 static inline struct dma_chan
 *dma_request_slave_channel_compat(const dma_cap_mask_t mask,
 				  dma_filter_fn fn, void *fn_param,
@@ -1803,10 +1822,15 @@ dmaengine_get_direction_text(enum dma_transfer_direction dir)
 	}
 }
 
+static inline struct device *dmaengine_chan_dev(struct dma_chan *chan)
+{
+	return &chan->chan_dev->device;
+}
+
 static inline struct device *dmaengine_get_dma_device(struct dma_chan *chan)
 {
-	if (chan->dev->chan_dma_dev)
-		return &chan->dev->device;
+	if (chan->chan_dev->chan_dma_dev)
+		return dmaengine_chan_dev(chan);
 
 	return chan->device->dev;
 }

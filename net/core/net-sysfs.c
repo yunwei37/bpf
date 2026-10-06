@@ -118,6 +118,49 @@ unbreak:
 	return ret;
 }
 
+static int sysfs_get_link_ksettings(struct device *dev,
+				    struct device_attribute *attr,
+				    struct ethtool_link_ksettings *cmd)
+{
+	struct net_device *netdev = to_net_dev(dev);
+	bool need_rtnl;
+	int ret;
+
+	/*
+	 * The check is also done in netif_get_link_ksettings; this helps
+	 * returning early without hitting the locking section below.
+	 */
+	if (!netdev->ethtool_ops->get_link_ksettings)
+		return -EINVAL;
+
+	need_rtnl = !netdev_need_ops_lock(netdev) ||
+		    (netdev->ethtool_ops->op_needs_rtnl &
+		     ETHTOOL_OP_NEEDS_RTNL_LINKSETTINGS);
+	if (need_rtnl) {
+		ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+		if (ret)
+			return ret;
+	}
+	netdev_lock_ops(netdev);
+
+	if (!dev_isalive(netdev)) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+
+	ret = -EINVAL;
+	if (netif_running(netdev)) {
+		if (!netif_get_link_ksettings(netdev, cmd))
+			ret = 0;
+	}
+
+unlock:
+	netdev_unlock_ops(netdev);
+	if (need_rtnl)
+		rtnl_unlock();
+	return ret;
+}
+
 /* use same locking rules as GIF* ioctl's */
 static ssize_t netdev_show(const struct device *dev,
 			   struct device_attribute *attr, char *buf,
@@ -332,70 +375,41 @@ static DEVICE_ATTR_RW(carrier);
 static ssize_t speed_show(struct device *dev,
 			  struct device_attribute *attr, char *buf)
 {
-	struct net_device *netdev = to_net_dev(dev);
-	int ret = -EINVAL;
+	struct ethtool_link_ksettings cmd;
+	int ret;
 
-	/* The check is also done in __ethtool_get_link_ksettings; this helps
-	 * returning early without hitting the locking section below.
-	 */
-	if (!netdev->ethtool_ops->get_link_ksettings)
-		return ret;
-
-	ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+	ret = sysfs_get_link_ksettings(dev, attr, &cmd);
 	if (ret)
 		return ret;
 
-	ret = -EINVAL;
-	if (netif_running(netdev)) {
-		struct ethtool_link_ksettings cmd;
-
-		if (!__ethtool_get_link_ksettings(netdev, &cmd))
-			ret = sysfs_emit(buf, fmt_dec, cmd.base.speed);
-	}
-	rtnl_unlock();
-	return ret;
+	return sysfs_emit(buf, fmt_dec, cmd.base.speed);
 }
 static DEVICE_ATTR_RO(speed);
 
 static ssize_t duplex_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
 {
-	struct net_device *netdev = to_net_dev(dev);
-	int ret = -EINVAL;
+	struct ethtool_link_ksettings cmd;
+	const char *duplex;
+	int ret;
 
-	/* The check is also done in __ethtool_get_link_ksettings; this helps
-	 * returning early without hitting the locking section below.
-	 */
-	if (!netdev->ethtool_ops->get_link_ksettings)
-		return ret;
-
-	ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+	ret = sysfs_get_link_ksettings(dev, attr, &cmd);
 	if (ret)
 		return ret;
 
-	ret = -EINVAL;
-	if (netif_running(netdev)) {
-		struct ethtool_link_ksettings cmd;
-
-		if (!__ethtool_get_link_ksettings(netdev, &cmd)) {
-			const char *duplex;
-
-			switch (cmd.base.duplex) {
-			case DUPLEX_HALF:
-				duplex = "half";
-				break;
-			case DUPLEX_FULL:
-				duplex = "full";
-				break;
-			default:
-				duplex = "unknown";
-				break;
-			}
-			ret = sysfs_emit(buf, "%s\n", duplex);
-		}
+	switch (cmd.base.duplex) {
+	case DUPLEX_HALF:
+		duplex = "half";
+		break;
+	case DUPLEX_FULL:
+		duplex = "full";
+		break;
+	default:
+		duplex = "unknown";
+		break;
 	}
-	rtnl_unlock();
-	return ret;
+
+	return sysfs_emit(buf, "%s\n", duplex);
 }
 static DEVICE_ATTR_RO(duplex);
 
@@ -1156,8 +1170,11 @@ static void rx_queue_release(struct kobject *kobj)
 		kvfree_rcu_mightsleep(rps_tag_to_table(tag_ptr));
 #endif
 
+	netdev_tracker_free(queue->dev, &queue->dev_tracker);
+	/* Pairs with the smp_mb() in rx_queue_add_kobject(). */
+	smp_mb();
 	memset(kobj, 0, sizeof(*kobj));
-	netdev_put(queue->dev, &queue->dev_tracker);
+	__dev_put(queue->dev);
 }
 
 static const struct ns_common *rx_queue_namespace(const struct kobject *kobj)
@@ -1229,6 +1246,9 @@ static int rx_queue_add_kobject(struct net_device *dev, int index)
 		netdev_warn_once(dev, "Cannot re-add rx queues before their removal completed");
 		return -EAGAIN;
 	}
+
+	/* Pairs with the smp_mb() in rx_queue_release(). */
+	smp_mb();
 
 	/* Kobject_put later will trigger rx_queue_release call which
 	 * decreases dev refcount: Take that reference here
@@ -1906,8 +1926,11 @@ static void netdev_queue_release(struct kobject *kobj)
 {
 	struct netdev_queue *queue = to_netdev_queue(kobj);
 
+	netdev_tracker_free(queue->dev, &queue->dev_tracker);
+	/* Pairs with the smp_mb() in netdev_queue_add_kobject(). */
+	smp_mb();
 	memset(kobj, 0, sizeof(*kobj));
-	netdev_put(queue->dev, &queue->dev_tracker);
+	__dev_put(queue->dev);
 }
 
 static const struct ns_common *netdev_queue_namespace(const struct kobject *kobj)
@@ -1966,6 +1989,9 @@ static int netdev_queue_add_kobject(struct net_device *dev, int index)
 		netdev_warn_once(dev, "Cannot re-add tx queues before their removal completed");
 		return -EAGAIN;
 	}
+
+	/* Pairs with the smp_mb() in netdev_queue_release(). */
+	smp_mb();
 
 	/* Kobject_put later will trigger netdev_queue_release call
 	 * which decreases dev refcount: Take that reference here

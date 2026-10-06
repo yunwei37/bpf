@@ -5,6 +5,7 @@
 
 #include <linux/iopoll.h>
 #include <linux/string_helpers.h>
+#include <linux/seq_file.h>
 
 #include <drm/drm_print.h>
 #include <drm/intel/intel_pcode_regs.h>
@@ -2076,9 +2077,9 @@ static void assert_ved_power_gated(struct intel_display *display)
 static void assert_isp_power_gated(struct intel_display *display)
 {
 	static const struct pci_device_id isp_ids[] = {
-		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x0f38)},
-		{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x22b8)},
-		{}
+		{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ISP_BYT) },
+		{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_ISP_BSW) },
+		{ }
 	};
 
 	drm_WARN(display->drm, !pci_dev_present(isp_ids) &&
